@@ -1,6 +1,5 @@
 // =============================================================================
-// server.js — VIDROOM Streaming Server
-// Complete system with TMDB proxy, video source extraction, and caching
+// server.js — VIDROOM Streaming Server with YouTube Integration
 // =============================================================================
 
 const express = require('express');
@@ -14,6 +13,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
+const { google } = require('googleapis');
 const os = require('os');
 
 const app = express();
@@ -25,579 +25,356 @@ const HOST = '0.0.0.0';
 // =============================================================================
 const TMDB_API_KEY = process.env.TMDB_API_KEY || '480f73d92f9395eb2140f092c746b3bc';
 const TMDB_BASE_URL = 'https://api.themoviedb.org/3';
+
+// YouTube API Configuration
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || '';
+const YOUTUBE_EMBED_BASE = 'https://www.youtube.com/embed';
+
+// Vidsrc Configuration
 const VSRC_BASE_URL = 'https://vidsrc.sbs/embed';
-const CACHE_DURATION = 86400; // 24 hours in seconds
-const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
-];
 
-// Directories
-const CACHE_DIR = path.join(__dirname, 'cache');
-const LOG_DIR = path.join(__dirname, 'logs');
-
-[CACHE_DIR, LOG_DIR].forEach(dir => {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-});
+// Cache Configuration
+const CACHE_DURATION = 86400; // 24 hours
 
 // =============================================================================
-// MIDDLEWARE
+// YOUTUBE CLIENT
 // =============================================================================
-app.use(helmet({
-    contentSecurityPolicy: {
-        directives: {
-            defaultSrc: ["'self'"],
-            frameSrc: ["'self'", "https://vidsrc.sbs", "https://www.youtube.com"],
-            imgSrc: ["'self'", "data:", "https://image.tmdb.org"],
-            scriptSrc: ["'self'", "'unsafe-inline'"],
-            styleSrc: ["'self'", "'unsafe-inline'"],
-        },
-    },
-}));
-
-app.use(cors({
-    origin: [
-        'http://localhost:3000',
-        'http://localhost:5500',
-        'http://127.0.0.1:5500',
-        'https://vidroom.vercel.app',
-        'https://vidroom.netlify.app'
-    ],
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
-}));
-
-app.use(compression());
-app.use(express.json({ limit: '10mb' }));
-
-// Rate limiting
-const limiter = rateLimit({
-    windowMs: 60 * 1000, // 1 minute
-    max: 150, // 150 requests per minute
-    message: { error: 'Too many requests, please try again later.' },
-    standardHeaders: true,
-    legacyHeaders: false,
-});
-app.use('/api/', limiter);
-
-// =============================================================================
-// LOGGING SYSTEM
-// =============================================================================
-function logInfo(context, message, data = {}) {
-    console.log(`📌 [${context}]`, message, Object.keys(data).length ? JSON.stringify(data) : '');
-}
-
-function logError(context, error, metadata = {}) {
-    const logEntry = {
-        timestamp: new Date().toISOString(),
-        context,
-        error: error.message,
-        stack: error.stack,
-        metadata
-    };
-    
-    const logFile = path.join(LOG_DIR, `error-${new Date().toISOString().split('T')[0]}.log`);
-    fs.appendFileSync(logFile, JSON.stringify(logEntry) + '\n');
-    console.error(`❌ [${context}]`, error.message);
-}
-
-// =============================================================================
-// CACHE SYSTEM
-// =============================================================================
-const linkCache = new NodeCache({
-    stdTTL: CACHE_DURATION,
-    checkperiod: 3600,
-    useClones: false
-});
-
-const CACHE_FILE = path.join(CACHE_DIR, 'links-cache.json');
-
-function loadCacheFromDisk() {
-    try {
-        if (fs.existsSync(CACHE_FILE)) {
-            const data = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-            Object.entries(data).forEach(([key, value]) => {
-                linkCache.set(key, value);
-            });
-            console.log(`✅ Loaded ${Object.keys(data).length} cached entries`);
-        }
-    } catch (error) {
-        console.error('Failed to load cache:', error.message);
-    }
-}
-
-function saveCacheToDisk() {
-    try {
-        const keys = linkCache.keys();
-        const cacheData = {};
-        keys.forEach(key => {
-            cacheData[key] = linkCache.get(key);
+class YouTubeClient {
+    constructor() {
+        this.apiKey = YOUTUBE_API_KEY;
+        this.youtube = google.youtube({
+            version: 'v3',
+            auth: this.apiKey
         });
-        fs.writeFileSync(CACHE_FILE, JSON.stringify(cacheData, null, 2));
-        console.log(`💾 Saved ${keys.length} entries to disk cache`);
-    } catch (error) {
-        console.error('Failed to save cache:', error.message);
-    }
-}
-
-setInterval(saveCacheToDisk, 5 * 60 * 1000);
-loadCacheFromDisk();
-
-// =============================================================================
-// AXIOS INSTANCE
-// =============================================================================
-axiosRetry(axios, {
-    retries: 3,
-    retryDelay: axiosRetry.exponentialDelay,
-    retryCondition: (error) => {
-        return axiosRetry.isNetworkOrIdempotentRequestError(error) ||
-               error.response?.status >= 500;
-    }
-});
-
-const axiosWithProxy = axios.create({
-    timeout: 30000,
-    maxRedirects: 5,
-    validateStatus: status => status < 400,
-    headers: {
-        'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
-    }
-});
-
-// =============================================================================
-// TITLE MATCHER
-// =============================================================================
-class TitleMatcher {
-    constructor() {
-        this.minScore = 0.7;
+        this.cache = new NodeCache({ stdTTL: 3600 }); // 1 hour cache for YouTube
+        this.isConfigured = !!this.apiKey && this.apiKey !== '';
     }
 
-    calculateSimilarity(title1, title2) {
-        const normalize = (str) => {
-            return str.toLowerCase()
-                .replace(/[^\w\s]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
-        };
-
-        const a = normalize(title1);
-        const b = normalize(title2);
-
-        if (a === b) return 1.0;
-
-        if (a.includes(b) || b.includes(a)) {
-            const longer = a.length > b.length ? a : b;
-            const shorter = a.length > b.length ? b : a;
-            return shorter.length / longer.length;
+    async searchVideos(query, maxResults = 10) {
+        if (!this.isConfigured) {
+            // Fallback: Use direct embed URLs without API
+            return this.getFallbackResults(query, maxResults);
         }
 
-        const distance = this.levenshteinDistance(a, b);
-        const maxLength = Math.max(a.length, b.length);
-        return 1 - (distance / maxLength);
-    }
-
-    levenshteinDistance(a, b) {
-        const matrix = [];
-        for (let i = 0; i <= b.length; i++) matrix[i] = [i];
-        for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
-
-        for (let i = 1; i <= b.length; i++) {
-            for (let j = 1; j <= a.length; j++) {
-                if (b.charAt(i - 1) === a.charAt(j - 1)) {
-                    matrix[i][j] = matrix[i - 1][j - 1];
-                } else {
-                    matrix[i][j] = Math.min(
-                        matrix[i - 1][j - 1] + 1,
-                        matrix[i][j - 1] + 1,
-                        matrix[i - 1][j] + 1
-                    );
-                }
-            }
-        }
-        return matrix[b.length][a.length];
-    }
-
-    isMatch(sourceTitle, sourceYear, targetTitle, targetYear) {
-        let score = this.calculateSimilarity(sourceTitle, targetTitle);
-        
-        if (sourceYear && targetYear && Math.abs(sourceYear - targetYear) <= 1) {
-            score += 0.15;
-        }
-        
-        if (sourceYear && targetYear && Math.abs(sourceYear - targetYear) > 2) {
-            score -= 0.3;
-        }
-        
-        return Math.min(1, Math.max(0, score)) >= this.minScore;
-    }
-}
-
-// =============================================================================
-// SOURCE EXTRACTORS
-// =============================================================================
-
-class VidsrcExtractor {
-    constructor() {
-        this.name = 'vidsrc';
-    }
-
-    async extract(movieId, title, year) {
-        const embedUrl = `https://vidsrc.to/embed/movie/${movieId}`;
-        const links = [];
+        const cacheKey = `search_${query}_${maxResults}`;
+        const cached = this.cache.get(cacheKey);
+        if (cached) return cached;
 
         try {
-            const response = await axiosWithProxy.get(embedUrl);
-            const $ = cheerio.load(response.data);
-
-            // Extract from video sources
-            $('source').each((i, el) => {
-                const src = $(el).attr('src');
-                if (src && src.includes('.mp4')) {
-                    links.push({
-                        url: src,
-                        quality: this.detectQuality(src),
-                        type: 'mp4'
-                    });
-                }
+            const response = await this.youtube.search.list({
+                part: ['snippet'],
+                q: query,
+                maxResults: maxResults,
+                type: ['video'],
+                videoEmbeddable: 'true',
+                safeSearch: 'moderate'
             });
 
-            // Extract from iframes
-            $('iframe').each((i, el) => {
-                const src = $(el).attr('src');
-                if (src && (src.includes('embed') || src.includes('play'))) {
-                    links.push({
-                        url: src,
-                        type: 'embed'
-                    });
-                }
-            });
+            const results = response.data.items.map(item => ({
+                id: item.id.videoId,
+                title: item.snippet.title,
+                description: item.snippet.description,
+                thumbnail: item.snippet.thumbnails.medium.url,
+                channelTitle: item.snippet.channelTitle,
+                publishedAt: item.snippet.publishedAt,
+                embedUrl: `${YOUTUBE_EMBED_BASE}/${item.id.videoId}`,
+                watchUrl: `https://www.youtube.com/watch?v=${item.id.videoId}`
+            }));
 
-            // Extract from data attributes
-            $('[data-src], [data-url], [data-video]').each((i, el) => {
-                const dataSrc = $(el).attr('data-src') || $(el).attr('data-url') || $(el).attr('data-video');
-                if (dataSrc && dataSrc.includes('http')) {
-                    links.push({
-                        url: dataSrc,
-                        quality: this.detectQuality(dataSrc),
-                        type: 'mp4'
-                    });
-                }
-            });
-
-            return {
-                source: this.name,
-                links: this.deduplicateLinks(links)
-            };
+            this.cache.set(cacheKey, results);
+            return results;
         } catch (error) {
-            throw new Error(`Vidsrc extraction failed: ${error.message}`);
+            console.error('YouTube search error:', error.message);
+            return this.getFallbackResults(query, maxResults);
         }
     }
 
-    detectQuality(url) {
-        if (url.includes('1080') || url.includes('1080p')) return '1080p';
-        if (url.includes('720') || url.includes('720p')) return '720p';
-        if (url.includes('480') || url.includes('480p')) return '480p';
-        return 'auto';
-    }
+    async getVideoDetails(videoId) {
+        if (!this.isConfigured) {
+            return {
+                id: videoId,
+                embedUrl: `${YOUTUBE_EMBED_BASE}/${videoId}`,
+                watchUrl: `https://www.youtube.com/watch?v=${videoId}`
+            };
+        }
 
-    deduplicateLinks(links) {
-        const seen = new Set();
-        return links.filter(link => {
-            const key = link.url.split('?')[0];
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        });
-    }
-}
+        const cacheKey = `video_${videoId}`;
+        const cached = this.cache.get(cacheKey);
+        if (cached) return cached;
 
-class EmbedExtractor {
-    constructor() {
-        this.name = 'embed';
-    }
+        try {
+            const response = await this.youtube.videos.list({
+                part: ['snippet', 'contentDetails', 'statistics'],
+                id: [videoId]
+            });
 
-    async extract(movieId, title, year) {
-        const domains = [
-            `https://multiembed.mov/directstream.php?video_id=${movieId}&s=movie`,
-            `https://embed.su/embed/movie/${movieId}`,
-            `https://moviesapi.club/movie/${movieId}`
-        ];
-
-        const links = [];
-
-        for (const domain of domains) {
-            try {
-                const response = await axiosWithProxy.get(domain, {
-                    headers: {
-                        'Referer': 'https://www.google.com/',
-                        'Origin': 'https://www.google.com'
-                    }
-                });
-
-                // JSON responses
-                if (typeof response.data === 'object') {
-                    if (response.data.sources) {
-                        response.data.sources.forEach(source => {
-                            if (source.file || source.url) {
-                                links.push({
-                                    url: source.file || source.url,
-                                    quality: source.label || source.quality || 'auto',
-                                    type: 'mp4'
-                                });
-                            }
-                        });
-                    }
-                }
-
-                // HTML parsing
-                const $ = cheerio.load(response.data);
-
-                $('video source, video[src], .player source, .video-js source').each((i, el) => {
-                    const src = $(el).attr('src') || $(el).parent().attr('src');
-                    if (src && src.match(/\.(mp4|m3u8)/)) {
-                        links.push({
-                            url: src,
-                            quality: $(el).attr('data-quality') || 'auto',
-                            type: src.includes('.m3u8') ? 'hls' : 'mp4'
-                        });
-                    }
-                });
-
-                // Script extraction
-                const scripts = $('script').map((i, el) => $(el).html()).get();
-                scripts.forEach(script => {
-                    if (script) {
-                        const urlMatches = script.match(/https?:\/\/[^"'\s]+\.(mp4|m3u8)[^"'\s]*/g);
-                        if (urlMatches) {
-                            urlMatches.forEach(url => {
-                                links.push({
-                                    url: url,
-                                    quality: url.includes('1080') ? '1080p' : 
-                                            url.includes('720') ? '720p' : 'auto',
-                                    type: url.includes('.m3u8') ? 'hls' : 'mp4'
-                                });
-                            });
-                        }
-                    }
-                });
-
-            } catch (error) {
-                continue;
+            if (!response.data.items || response.data.items.length === 0) {
+                throw new Error('Video not found');
             }
+
+            const item = response.data.items[0];
+            const result = {
+                id: videoId,
+                title: item.snippet.title,
+                description: item.snippet.description,
+                thumbnail: item.snippet.thumbnails.high?.url || item.snippet.thumbnails.medium?.url,
+                channelTitle: item.snippet.channelTitle,
+                publishedAt: item.snippet.publishedAt,
+                duration: item.contentDetails.duration,
+                viewCount: item.statistics.viewCount,
+                likeCount: item.statistics.likeCount,
+                embedUrl: `${YOUTUBE_EMBED_BASE}/${videoId}`,
+                watchUrl: `https://www.youtube.com/watch?v=${videoId}`
+            };
+
+            this.cache.set(cacheKey, result);
+            return result;
+        } catch (error) {
+            console.error('YouTube video details error:', error.message);
+            return {
+                id: videoId,
+                embedUrl: `${YOUTUBE_EMBED_BASE}/${videoId}`,
+                watchUrl: `https://www.youtube.com/watch?v=${videoId}`
+            };
+        }
+    }
+
+    async getMovieTrailers(movieTitle, year = null) {
+        let searchQuery = `${movieTitle} movie trailer`;
+        if (year) {
+            searchQuery += ` ${year}`;
         }
 
-        return {
-            source: this.name,
-            links: this.deduplicateLinks(links)
-        };
-    }
-
-    deduplicateLinks(links) {
-        const seen = new Set();
-        return links.filter(link => {
-            const key = link.url.split('?')[0];
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        });
-    }
-}
-
-class MultiEmbedExtractor {
-    constructor() {
-        this.name = 'multisrc';
-    }
-
-    async extract(movieId, title, year) {
-        const baseUrls = [
-            `https://vidsrc.xyz/embed/movie/${movieId}`,
-            `https://www.2embed.cc/embed/${movieId}`,
-            `https://autoembed.co/movie/tmdb/${movieId}`,
-            `https://dbgo.fun/movie/${movieId}`
-        ];
-
-        const links = [];
-
-        for (const baseUrl of baseUrls) {
-            try {
-                const response = await axiosWithProxy.get(baseUrl, {
-                    headers: {
-                        'Referer': 'https://www.google.com/'
-                    }
-                });
-
-                const $ = cheerio.load(response.data);
-
-                const patterns = [
-                    'iframe[src]',
-                    'source[src]',
-                    '[data-player]',
-                    '[data-video]',
-                    '[data-src]',
-                    '#player source',
-                    '.player source'
-                ];
-
-                patterns.forEach(pattern => {
-                    $(pattern).each((i, el) => {
-                        let src = $(el).attr('src') || 
-                                 $(el).attr('data-player') || 
-                                 $(el).attr('data-video') || 
-                                 $(el).attr('data-src');
-                        
-                        if (src) {
-                            if (src.startsWith('//')) {
-                                src = 'https:' + src;
-                            } else if (src.startsWith('/')) {
-                                src = new URL(src, baseUrl).href;
-                            }
-                            
-                            if (src.match(/\.(mp4|m3u8)/) || src.includes('embed') || src.includes('video')) {
-                                links.push({
-                                    url: src,
-                                    quality: this.detectQuality(src),
-                                    type: src.includes('.m3u8') ? 'hls' : 
-                                          src.includes('embed') ? 'embed' : 'mp4'
-                                });
-                            }
-                        }
-                    });
-                });
-
-                // JSON configs in scripts
-                const scripts = $('script').map((i, el) => $(el).html()).get();
-                scripts.forEach(script => {
-                    if (script && script.includes('sources') && script.includes('file')) {
-                        try {
-                            const jsonMatch = script.match(/sources:\s*(\[.*?\])/s);
-                            if (jsonMatch) {
-                                const sources = JSON.parse(jsonMatch[1].replace(/'/g, '"'));
-                                sources.forEach(source => {
-                                    if (source.file) {
-                                        links.push({
-                                            url: source.file,
-                                            quality: source.label || 'auto',
-                                            type: 'mp4'
-                                        });
-                                    }
-                                });
-                            }
-                        } catch (e) {
-                            // Ignore JSON parse errors
-                        }
-                    }
-                });
-
-            } catch (error) {
-                continue;
-            }
-        }
-
-        return {
-            source: this.name,
-            links: this.deduplicateLinks(links)
-        };
-    }
-
-    detectQuality(url) {
-        if (url.includes('1080') || url.includes('1080p')) return '1080p';
-        if (url.includes('720') || url.includes('720p')) return '720p';
-        if (url.includes('480') || url.includes('480p')) return '480p';
-        return 'auto';
-    }
-
-    deduplicateLinks(links) {
-        const seen = new Set();
-        return links.filter(link => {
-            const key = link.url.split('?')[0];
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        });
-    }
-}
-
-// =============================================================================
-// LINK EXTRACTOR MAIN
-// =============================================================================
-class LinkExtractor {
-    constructor() {
-        this.sources = [
-            new VidsrcExtractor(),
-            new EmbedExtractor(),
-            new MultiEmbedExtractor()
-        ];
-    }
-
-    async extractLinks(movieId, title, year) {
-        const cacheKey = `movie_${movieId}_${year}`;
-        const cached = linkCache.get(cacheKey);
+        const results = await this.searchVideos(searchQuery, 5);
         
-        if (cached) {
-            logInfo('CACHE', `Cache hit for ${title}`, { movieId });
-            return { ...cached, cached: true };
+        // Filter for trailers specifically
+        const trailers = results.filter(v => {
+            const title = v.title.toLowerCase();
+            return title.includes('trailer') || 
+                   title.includes('teaser') || 
+                   title.includes('official') ||
+                   title.includes('preview');
+        });
+
+        return trailers.length > 0 ? trailers : results;
+    }
+
+    async getTVShowTrailers(showTitle, season = null) {
+        let searchQuery = `${showTitle} TV show trailer`;
+        if (season) {
+            searchQuery += ` season ${season}`;
         }
 
-        logInfo('EXTRACT', `Extracting links for ${title} (${year})`);
+        const results = await this.searchVideos(searchQuery, 5);
         
+        const trailers = results.filter(v => {
+            const title = v.title.toLowerCase();
+            return title.includes('trailer') || 
+                   title.includes('teaser') || 
+                   title.includes('official') ||
+                   title.includes('preview');
+        });
+
+        return trailers.length > 0 ? trailers : results;
+    }
+
+    async getSoundtrack(movieTitle) {
+        const searchQuery = `${movieTitle} soundtrack`;
+        const results = await this.searchVideos(searchQuery, 8);
+        
+        // Filter for music/soundtrack
+        const music = results.filter(v => {
+            const title = v.title.toLowerCase();
+            return title.includes('soundtrack') || 
+                   title.includes('score') || 
+                   title.includes('music') ||
+                   title.includes('song') ||
+                   title.includes('theme');
+        });
+
+        return music.length > 0 ? music : results;
+    }
+
+    async getMusicVideos(query, maxResults = 10) {
+        return await this.searchVideos(query, maxResults);
+    }
+
+    getFallbackResults(query, maxResults = 10) {
+        // Return embed URLs without API validation
         const results = [];
-
-        const extractPromises = this.sources.map(async (source) => {
-            try {
-                const timeoutPromise = new Promise((_, reject) => {
-                    setTimeout(() => reject(new Error('Source timeout')), 15000);
-                });
-
-                const sourcePromise = source.extract(movieId, title, year);
-                const result = await Promise.race([sourcePromise, timeoutPromise]);
-                
-                if (result && result.links && result.links.length > 0) {
-                    results.push(result);
-                }
-            } catch (error) {
-                logError('EXTRACTOR', error, { source: source.name, movieId });
-            }
-        });
-
-        await Promise.allSettled(extractPromises);
-
-        if (results.length === 0) {
-            return { error: 'No working links found' };
+        const searchTerm = encodeURIComponent(query);
+        for (let i = 0; i < maxResults; i++) {
+            // This is a placeholder - actual search requires YouTube API
+            results.push({
+                id: `fallback_${i}`,
+                title: `${query} - Search Result ${i + 1}`,
+                description: 'Search result from YouTube (API key required for full results)',
+                thumbnail: 'https://via.placeholder.com/320x180?text=YouTube',
+                channelTitle: 'YouTube',
+                embedUrl: `https://www.youtube.com/embed?q=${searchTerm}`,
+                watchUrl: `https://www.youtube.com/results?search_query=${searchTerm}`,
+                isFallback: true
+            });
         }
-
-        const output = {
-            movieId,
-            title,
-            year,
-            timestamp: Date.now(),
-            sources: results,
-            primary: results[0]?.links[0] || null
-        };
-
-        linkCache.set(cacheKey, output);
-        
-        return output;
+        return results;
     }
 }
 
 // =============================================================================
-// TMDB PROXY
+// YOUTUBE EMBED GENERATOR (No API Key Required)
+// =============================================================================
+class YouTubeEmbedGenerator {
+    constructor() {
+        this.embedBase = YOUTUBE_EMBED_BASE;
+    }
+
+    // Generate direct embed URL from video ID
+    getEmbedUrl(videoId, options = {}) {
+        const params = new URLSearchParams();
+        
+        if (options.autoplay) params.append('autoplay', '1');
+        if (options.controls !== undefined) params.append('controls', options.controls ? '1' : '0');
+        if (options.rel !== undefined) params.append('rel', options.rel ? '1' : '0');
+        if (options.modestbranding !== undefined) params.append('modestbranding', options.modestbranding ? '1' : '0');
+        if (options.showinfo !== undefined) params.append('showinfo', options.showinfo ? '1' : '0');
+        if (options.start) params.append('start', options.start);
+        if (options.end) params.append('end', options.end);
+        if (options.loop) params.append('loop', '1');
+        if (options.playlist) params.append('playlist', options.playlist);
+        
+        const paramString = params.toString();
+        return `${this.embedBase}/${videoId}${paramString ? '?' + paramString : ''}`;
+    }
+
+    // Generate embed URL with search query
+    getSearchEmbed(query) {
+        return `${this.embedBase}?q=${encodeURIComponent(query)}`;
+    }
+
+    // Get YouTube thumbnail URLs
+    getThumbnails(videoId) {
+        return {
+            default: `https://img.youtube.com/vi/${videoId}/default.jpg`,
+            medium: `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
+            high: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
+            standard: `https://img.youtube.com/vi/${videoId}/sddefault.jpg`,
+            maxres: `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`
+        };
+    }
+
+    // Extract video ID from various YouTube URL formats
+    extractVideoId(url) {
+        const patterns = [
+            /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
+            /youtube\.com\/v\/([a-zA-Z0-9_-]{11})/,
+            /youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/
+        ];
+
+        for (const pattern of patterns) {
+            const match = url.match(pattern);
+            if (match) return match[1];
+        }
+
+        return null;
+    }
+}
+
+// =============================================================================
+// YOUTUBE TRAILER CACHE
+// =============================================================================
+class TrailerCache {
+    constructor() {
+        this.cache = new NodeCache({ stdTTL: 86400 }); // 24 hours
+        this.trailerMap = new Map();
+        
+        // Pre-cache popular trailer mappings
+        this.initializeTrailerMap();
+    }
+
+    initializeTrailerMap() {
+        // Common movie trailer searches that work well
+        const trailers = {
+            'dune': '8Bk1TtHj_0o',
+            'dune part two': 'cTAlr6m6ijU',
+            'oppenheimer': 'uYPbbksJxIg',
+            'barbie': 'pBk4NYhWNMM',
+            'the batman': 'mqqft2x_Aa4',
+            'spider-man': 'qI22U71gGng',
+            'avatar': 'd9MyW72ELq0',
+            'interstellar': 'zSWdZVtXT7E',
+            'inception': 'YoHD9XEInc0',
+            'the dark knight': 'EXeTwQWrcwY',
+            'gladiator': 'owK1qxDselE',
+            'the matrix': 'vKQi3bBA1y8',
+            'pulp fiction': 's7EdQ4FqbhY',
+            'the godfather': 'sY1S34973zA',
+            'titanic': 'zCy5WQ9S4c0',
+            'star wars': 'vZ734NWnAHA',
+            'harry potter': 'V6xLVtpbpJg',
+            'lord of the rings': 'V75dMMIW2B4'
+        };
+
+        Object.entries(trailers).forEach(([key, value]) => {
+            this.trailerMap.set(key, value);
+        });
+    }
+
+    getTrailerId(movieTitle) {
+        const lowerTitle = movieTitle.toLowerCase();
+        
+        // Check exact match
+        if (this.trailerMap.has(lowerTitle)) {
+            return this.trailerMap.get(lowerTitle);
+        }
+
+        // Check partial match
+        for (const [key, value] of this.trailerMap) {
+            if (lowerTitle.includes(key) || key.includes(lowerTitle)) {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    setTrailerId(movieTitle, videoId) {
+        const lowerTitle = movieTitle.toLowerCase();
+        this.trailerMap.set(lowerTitle, videoId);
+        this.cache.set(lowerTitle, videoId);
+    }
+}
+
+// =============================================================================
+// TMDB PROXY (with YouTube integration)
 // =============================================================================
 class TMDBProxy {
+    constructor() {
+        this.youtubeClient = new YouTubeClient();
+        this.youtubeEmbed = new YouTubeEmbedGenerator();
+        this.trailerCache = new TrailerCache();
+    }
+
     async getMovie(id) {
         try {
             const response = await axios.get(
-                `${TMDB_BASE_URL}/movie/${id}?api_key=${TMDB_API_KEY}&append_to_response=credits,images,similar,videos`
+                `${TMDB_BASE_URL}/movie/${id}?api_key=${TMDB_API_KEY}&append_to_response=credits,images,similar,videos,keywords`
             );
-            return response.data;
+            const movie = response.data;
+
+            // Add YouTube trailers
+            const trailers = await this.getMovieTrailers(movie.title, new Date(movie.release_date).getFullYear());
+            
+            return {
+                ...movie,
+                youtube: {
+                    trailers: trailers,
+                    embed: {
+                        url: (trailers.length > 0) ? trailers[0].embedUrl : null,
+                        watchUrl: (trailers.length > 0) ? trailers[0].watchUrl : null
+                    },
+                    thumbnails: (trailers.length > 0) ? this.youtubeEmbed.getThumbnails(trailers[0].id) : null
+                }
+            };
         } catch (error) {
             throw new Error(`TMDB movie fetch failed: ${error.message}`);
         }
@@ -606,22 +383,123 @@ class TMDBProxy {
     async getTV(id) {
         try {
             const response = await axios.get(
-                `${TMDB_BASE_URL}/tv/${id}?api_key=${TMDB_API_KEY}&append_to_response=credits,images,similar,videos`
+                `${TMDB_BASE_URL}/tv/${id}?api_key=${TMDB_API_KEY}&append_to_response=credits,images,similar,videos,keywords`
             );
-            return response.data;
+            const show = response.data;
+
+            // Add YouTube trailers
+            const trailers = await this.getTVShowTrailers(show.name);
+
+            return {
+                ...show,
+                youtube: {
+                    trailers: trailers,
+                    embed: {
+                        url: (trailers.length > 0) ? trailers[0].embedUrl : null,
+                        watchUrl: (trailers.length > 0) ? trailers[0].watchUrl : null
+                    },
+                    thumbnails: (trailers.length > 0) ? this.youtubeEmbed.getThumbnails(trailers[0].id) : null
+                }
+            };
         } catch (error) {
             throw new Error(`TMDB TV fetch failed: ${error.message}`);
         }
     }
 
-    async getTVSeason(tvId, seasonNumber) {
+    async getMovieTrailers(title, year) {
+        // Check cache first
+        const cacheKey = `trailer_${title}_${year || ''}`;
+        const cached = this.trailerCache.cache.get(cacheKey);
+        if (cached) return cached;
+
+        // Check pre-mapped trailers
+        const mappedId = this.trailerCache.getTrailerId(title);
+        if (mappedId) {
+            const trailer = {
+                id: mappedId,
+                title: `${title} Official Trailer`,
+                embedUrl: this.youtubeEmbed.getEmbedUrl(mappedId, { autoplay: false }),
+                watchUrl: `https://www.youtube.com/watch?v=${mappedId}`,
+                thumbnail: this.youtubeEmbed.getThumbnails(mappedId)
+            };
+            this.trailerCache.cache.set(cacheKey, [trailer]);
+            return [trailer];
+        }
+
+        try {
+            // Search YouTube for trailers
+            const results = await this.youtubeClient.getMovieTrailers(title, year);
+            
+            // Cache results
+            if (results.length > 0) {
+                this.trailerCache.cache.set(cacheKey, results);
+                // Store first result in map
+                if (results[0].id) {
+                    this.trailerCache.setTrailerId(title, results[0].id);
+                }
+            }
+            
+            return results;
+        } catch (error) {
+            console.error('Failed to fetch YouTube trailers:', error.message);
+            // Return empty array if YouTube fails
+            return [];
+        }
+    }
+
+    async getTVShowTrailers(title, season) {
+        const cacheKey = `tv_trailer_${title}_${season || ''}`;
+        const cached = this.trailerCache.cache.get(cacheKey);
+        if (cached) return cached;
+
+        try {
+            const results = await this.youtubeClient.getTVShowTrailers(title, season);
+            if (results.length > 0) {
+                this.trailerCache.cache.set(cacheKey, results);
+            }
+            return results;
+        } catch (error) {
+            console.error('Failed to fetch TV trailers:', error.message);
+            return [];
+        }
+    }
+
+    async getSoundtrack(title) {
+        try {
+            return await this.youtubeClient.getSoundtrack(title);
+        } catch (error) {
+            console.error('Failed to fetch soundtrack:', error.message);
+            return [];
+        }
+    }
+
+    async getVideos(id, type = 'movie') {
         try {
             const response = await axios.get(
-                `${TMDB_BASE_URL}/tv/${tvId}/season/${seasonNumber}?api_key=${TMDB_API_KEY}`
+                `${TMDB_BASE_URL}/${type}/${id}/videos?api_key=${TMDB_API_KEY}`
             );
-            return response.data;
+            
+            const videos = response.data.results || [];
+            
+            // Enhance with YouTube embed URLs
+            const enhancedVideos = videos.map(video => {
+                if (video.site === 'YouTube') {
+                    return {
+                        ...video,
+                        embedUrl: this.youtubeEmbed.getEmbedUrl(video.key, { autoplay: false }),
+                        watchUrl: `https://www.youtube.com/watch?v=${video.key}`,
+                        thumbnail: this.youtubeEmbed.getThumbnails(video.key)
+                    };
+                }
+                return video;
+            });
+
+            return {
+                ...response.data,
+                results: enhancedVideos
+            };
         } catch (error) {
-            throw new Error(`TMDB season fetch failed: ${error.message}`);
+            return { results: [] };
         }
     }
 
@@ -650,148 +528,45 @@ class TMDBProxy {
             throw new Error(`TMDB discover failed: ${error.message}`);
         }
     }
-
-    async getVideos(id, type = 'movie') {
-        try {
-            const response = await axios.get(
-                `${TMDB_BASE_URL}/${type}/${id}/videos?api_key=${TMDB_API_KEY}`
-            );
-            return response.data;
-        } catch (error) {
-            return { results: [] };
-        }
-    }
 }
 
 // =============================================================================
-// DOWNLOAD MANAGER
+// MIDDLEWARE
 // =============================================================================
-class DownloadManager {
-    constructor() {
-        this.extractor = new LinkExtractor();
-        this.tmdb = new TMDBProxy();
-        this.matcher = new TitleMatcher();
-    }
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            frameSrc: ["'self'", "https://vidsrc.sbs", "https://www.youtube.com", "https://www.youtube-nocookie.com"],
+            imgSrc: ["'self'", "data:", "https://image.tmdb.org", "https://img.youtube.com"],
+            scriptSrc: ["'self'", "'unsafe-inline'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+        },
+    },
+}));
 
-    async getDownloadLinks(movieId, title, year) {
-        try {
-            const links = await this.extractor.extractLinks(movieId, title, year);
-            
-            if (links.error) {
-                throw new Error(links.error);
-            }
+app.use(cors({
+    origin: [
+        'http://localhost:3000',
+        'http://localhost:5500',
+        'http://127.0.0.1:5500',
+        'https://vidroom.vercel.app',
+        'https://vidroom.netlify.app'
+    ],
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
+}));
 
-            const processed = this.processLinks(links);
-            return processed;
+app.use(compression());
+app.use(express.json({ limit: '10mb' }));
 
-        } catch (error) {
-            logError('DOWNLOAD_MANAGER', error, { movieId, title });
-            throw error;
-        }
-    }
-
-    processLinks(links) {
-        const processed = {
-            movieId: links.movieId,
-            title: links.title,
-            year: links.year,
-            timestamp: links.timestamp,
-            cached: links.cached || false,
-            sources: [],
-            qualityOptions: {}
-        };
-
-        for (const source of links.sources) {
-            const sourceLinks = source.links.map(link => ({
-                ...link,
-                quality: this.normalizeQuality(link.quality)
-            }));
-
-            sourceLinks.sort((a, b) => this.qualityRank(b.quality) - this.qualityRank(a.quality));
-
-            processed.sources.push({
-                source: source.source,
-                links: sourceLinks,
-                bestQuality: sourceLinks[0]?.quality || 'unknown'
-            });
-        }
-
-        processed.sources.sort((a, b) => 
-            this.qualityRank(b.bestQuality) - this.qualityRank(a.bestQuality)
-        );
-
-        processed.qualityOptions = this.generateQualityOptions(processed.sources);
-
-        return processed;
-    }
-
-    normalizeQuality(quality) {
-        if (!quality || quality === 'auto') return '720p';
-        
-        quality = quality.toString().toLowerCase();
-        
-        if (quality.includes('1080') || quality.includes('1080p')) return '1080p';
-        if (quality.includes('720') || quality.includes('720p')) return '720p';
-        if (quality.includes('480') || quality.includes('480p')) return '480p';
-        if (quality.includes('360') || quality.includes('360p')) return '360p';
-        
-        return '720p';
-    }
-
-    qualityRank(quality) {
-        const ranks = {
-            '1080p': 5,
-            '720p': 4,
-            '480p': 3,
-            '360p': 2,
-            'unknown': 1
-        };
-        return ranks[quality] || 1;
-    }
-
-    generateQualityOptions(sources) {
-        const options = {};
-        
-        for (const source of sources) {
-            for (const link of source.links) {
-                if (!options[link.quality]) {
-                    options[link.quality] = [];
-                }
-                options[link.quality].push({
-                    source: source.source,
-                    url: link.url,
-                    type: link.type
-                });
-            }
-        }
-
-        const sorted = {};
-        const qualities = ['1080p', '720p', '480p', '360p'];
-        
-        for (const quality of qualities) {
-            if (options[quality]) {
-                sorted[quality] = options[quality];
-            }
-        }
-
-        return sorted;
-    }
-
-    async getStreamUrl(movieId, type, season, episode) {
-        const tmdbId = movieId;
-        
-        if (type === 'tv') {
-            return `${VSRC_BASE_URL}/tv/${tmdbId}/${season}/${episode}`;
-        }
-        return `${VSRC_BASE_URL}/movie/${tmdbId}`;
-    }
-}
-
-// =============================================================================
-// INITIALIZE MANAGERS
-// =============================================================================
-const downloadManager = new DownloadManager();
-const tmdbProxy = new TMDBProxy();
+// Rate limiting
+const limiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 150,
+    message: { error: 'Too many requests, please try again later.' }
+});
+app.use('/api/', limiter);
 
 // =============================================================================
 // API ENDPOINTS
@@ -799,20 +574,157 @@ const tmdbProxy = new TMDBProxy();
 
 // Health check
 app.get('/api/health', (req, res) => {
+    const youtubeClient = new YouTubeClient();
     res.json({
         status: 'ok',
         timestamp: Date.now(),
         uptime: process.uptime(),
-        cacheSize: linkCache.keys().length,
-        tmdbConfigured: !!TMDB_API_KEY && TMDB_API_KEY !== 'YOUR_TMDB_API_KEY_HERE'
+        youtube: {
+            configured: youtubeClient.isConfigured,
+            apiKey: YOUTUBE_API_KEY ? '✅ Set' : '❌ Missing'
+        }
     });
 });
 
-// TMDB Proxy Endpoints
+// =============================================================================
+// YOUTUBE API ENDPOINTS
+// =============================================================================
+
+// Search YouTube
+app.get('/api/youtube/search', async (req, res) => {
+    try {
+        const { q, maxResults = 10 } = req.query;
+        if (!q) {
+            return res.status(400).json({ error: 'Missing search query (q)' });
+        }
+
+        const youtube = new YouTubeClient();
+        const results = await youtube.searchVideos(q, parseInt(maxResults));
+        res.json({
+            query: q,
+            results: results,
+            total: results.length
+        });
+    } catch (error) {
+        logError('YOUTUBE_SEARCH', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get YouTube video details
+app.get('/api/youtube/video/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const youtube = new YouTubeClient();
+        const details = await youtube.getVideoDetails(id);
+        res.json(details);
+    } catch (error) {
+        logError('YOUTUBE_VIDEO', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get movie trailers from YouTube
+app.get('/api/youtube/trailers/movie', async (req, res) => {
+    try {
+        const { title, year } = req.query;
+        if (!title) {
+            return res.status(400).json({ error: 'Missing movie title' });
+        }
+
+        const tmdb = new TMDBProxy();
+        const trailers = await tmdb.getMovieTrailers(title, year ? parseInt(year) : null);
+        res.json({
+            movie: title,
+            year: year || null,
+            trailers: trailers
+        });
+    } catch (error) {
+        logError('YOUTUBE_TRAILERS_MOVIE', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get TV show trailers from YouTube
+app.get('/api/youtube/trailers/tv', async (req, res) => {
+    try {
+        const { title, season } = req.query;
+        if (!title) {
+            return res.status(400).json({ error: 'Missing TV show title' });
+        }
+
+        const tmdb = new TMDBProxy();
+        const trailers = await tmdb.getTVShowTrailers(title, season ? parseInt(season) : null);
+        res.json({
+            show: title,
+            season: season || null,
+            trailers: trailers
+        });
+    } catch (error) {
+        logError('YOUTUBE_TRAILERS_TV', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get soundtrack from YouTube
+app.get('/api/youtube/soundtrack', async (req, res) => {
+    try {
+        const { title } = req.query;
+        if (!title) {
+            return res.status(400).json({ error: 'Missing movie title' });
+        }
+
+        const tmdb = new TMDBProxy();
+        const soundtrack = await tmdb.getSoundtrack(title);
+        res.json({
+            movie: title,
+            soundtrack: soundtrack
+        });
+    } catch (error) {
+        logError('YOUTUBE_SOUNDTRACK', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Generate YouTube embed URL
+app.get('/api/youtube/embed', async (req, res) => {
+    try {
+        const { videoId, autoplay, controls, start, end } = req.query;
+        if (!videoId) {
+            return res.status(400).json({ error: 'Missing videoId' });
+        }
+
+        const embed = new YouTubeEmbedGenerator();
+        const url = embed.getEmbedUrl(videoId, {
+            autoplay: autoplay === 'true',
+            controls: controls !== 'false',
+            start: start ? parseInt(start) : null,
+            end: end ? parseInt(end) : null
+        });
+
+        const thumbnails = embed.getThumbnails(videoId);
+
+        res.json({
+            videoId,
+            embedUrl: url,
+            thumbnails: thumbnails,
+            watchUrl: `https://www.youtube.com/watch?v=${videoId}`
+        });
+    } catch (error) {
+        logError('YOUTUBE_EMBED', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// =============================================================================
+// TMDB PROXY ENDPOINTS (with YouTube integration)
+// =============================================================================
+
 app.get('/api/tmdb/movie/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const data = await tmdbProxy.getMovie(id);
+        const tmdb = new TMDBProxy();
+        const data = await tmdb.getMovie(id);
         res.json(data);
     } catch (error) {
         logError('API_TMDB_MOVIE', error);
@@ -823,7 +735,8 @@ app.get('/api/tmdb/movie/:id', async (req, res) => {
 app.get('/api/tmdb/tv/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const data = await tmdbProxy.getTV(id);
+        const tmdb = new TMDBProxy();
+        const data = await tmdb.getTV(id);
         res.json(data);
     } catch (error) {
         logError('API_TMDB_TV', error);
@@ -831,13 +744,14 @@ app.get('/api/tmdb/tv/:id', async (req, res) => {
     }
 });
 
-app.get('/api/tmdb/tv/:id/season/:season', async (req, res) => {
+app.get('/api/tmdb/:type/:id/videos', async (req, res) => {
     try {
-        const { id, season } = req.params;
-        const data = await tmdbProxy.getTVSeason(id, parseInt(season));
+        const { type, id } = req.params;
+        const tmdb = new TMDBProxy();
+        const data = await tmdb.getVideos(id, type);
         res.json(data);
     } catch (error) {
-        logError('API_TMDB_SEASON', error);
+        logError('API_TMDB_VIDEOS', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -848,7 +762,8 @@ app.get('/api/tmdb/search', async (req, res) => {
         if (!query) {
             return res.status(400).json({ error: 'Missing query parameter' });
         }
-        const data = await tmdbProxy.search(query);
+        const tmdb = new TMDBProxy();
+        const data = await tmdb.search(query);
         res.json(data);
     } catch (error) {
         logError('API_TMDB_SEARCH', error);
@@ -867,7 +782,8 @@ app.get('/api/tmdb/discover/:category', async (req, res) => {
             sort_by: sort_by || 'popularity.desc'
         };
         
-        const data = await tmdbProxy.discover(category, params);
+        const tmdb = new TMDBProxy();
+        const data = await tmdb.discover(category, params);
         res.json(data);
     } catch (error) {
         logError('API_TMDB_DISCOVER', error);
@@ -875,77 +791,10 @@ app.get('/api/tmdb/discover/:category', async (req, res) => {
     }
 });
 
-app.get('/api/tmdb/:type/:id/videos', async (req, res) => {
-    try {
-        const { type, id } = req.params;
-        const data = await tmdbProxy.getVideos(id, type);
-        res.json(data);
-    } catch (error) {
-        logError('API_TMDB_VIDEOS', error);
-        res.status(500).json({ error: error.message });
-    }
-});
+// =============================================================================
+// VSRC STREAM ENDPOINTS
+// =============================================================================
 
-// Popular and trending endpoints
-app.get('/api/tmdb/movie/popular', async (req, res) => {
-    try {
-        const { page = 1 } = req.query;
-        const data = await tmdbProxy.discover('movie', { 
-            page, 
-            sort_by: 'popularity.desc' 
-        });
-        res.json(data);
-    } catch (error) {
-        logError('API_POPULAR', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.get('/api/tmdb/tv/popular', async (req, res) => {
-    try {
-        const { page = 1 } = req.query;
-        const data = await tmdbProxy.discover('tv', { 
-            page, 
-            sort_by: 'popularity.desc' 
-        });
-        res.json(data);
-    } catch (error) {
-        logError('API_TV_POPULAR', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.get('/api/tmdb/movie/top_rated', async (req, res) => {
-    try {
-        const { page = 1 } = req.query;
-        const data = await tmdbProxy.discover('movie', { 
-            page, 
-            sort_by: 'vote_average.desc',
-            'vote_count.gte': 100
-        });
-        res.json(data);
-    } catch (error) {
-        logError('API_TOP_RATED', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.get('/api/tmdb/movie/now_playing', async (req, res) => {
-    try {
-        const { page = 1 } = req.query;
-        const data = await tmdbProxy.discover('movie', { 
-            page, 
-            sort_by: 'primary_release_date.desc',
-            'primary_release_date.lte': new Date().toISOString().split('T')[0]
-        });
-        res.json(data);
-    } catch (error) {
-        logError('API_NOW_PLAYING', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Get video source URL
 app.get('/api/stream/:type/:id', async (req, res) => {
     try {
         const { type, id } = req.params;
@@ -955,9 +804,9 @@ app.get('/api/stream/:type/:id', async (req, res) => {
         if (type === 'tv') {
             const s = season || 1;
             const e = episode || 1;
-            url = await downloadManager.getStreamUrl(id, type, s, e);
+            url = `${VSRC_BASE_URL}/tv/${id}/${s}/${e}`;
         } else {
-            url = await downloadManager.getStreamUrl(id, 'movie');
+            url = `${VSRC_BASE_URL}/movie/${id}`;
         }
         
         res.json({
@@ -973,240 +822,39 @@ app.get('/api/stream/:type/:id', async (req, res) => {
     }
 });
 
-// Get download options
-app.get('/api/download/options/:id', async (req, res) => {
-    try {
-        const { id } = req.params;
-        
-        const movieRes = await tmdbProxy.getMovie(id);
-        const movie = movieRes;
-        const year = new Date(movie.release_date).getFullYear();
-
-        const links = await downloadManager.getDownloadLinks(id, movie.title, year);
-        
-        const qualityOptions = Object.entries(links.qualityOptions || {}).map(([quality, sources]) => {
-            const runtime = movie.runtime || 120;
-            const sizePerMin = quality === '1080p' ? 25 : 
-                              quality === '720p' ? 12 : 
-                              quality === '480p' ? 8 : 5;
-            const sizeMB = Math.round(runtime * sizePerMin);
-
-            return {
-                quality,
-                label: `${quality} - H.264`,
-                size: sizeMB,
-                sizeText: sizeMB >= 1024 ? `${(sizeMB/1024).toFixed(2)} GB` : `${sizeMB} MB`,
-                sources: sources.map(s => s.url),
-                available: true
-            };
-        });
-
-        res.json({
-            movie: {
-                id: movie.id,
-                title: movie.title,
-                year,
-                runtime: movie.runtime || 120,
-                poster: movie.poster_path ? `https://image.tmdb.org/t/p/w500${movie.poster_path}` : null,
-                backdrop: movie.backdrop_path ? `https://image.tmdb.org/t/p/w1280${movie.backdrop_path}` : null
-            },
-            options: qualityOptions,
-            cached: links.cached || false,
-            timestamp: links.timestamp
-        });
-
-    } catch (error) {
-        logError('API_DOWNLOAD_OPTIONS', error);
-        res.status(500).json({ 
-            error: 'Failed to fetch download options',
-            details: error.message 
-        });
-    }
-});
-
-// Initiate download
-app.get('/api/download', async (req, res) => {
-    try {
-        const { movieId, quality, title } = req.query;
-
-        if (!movieId || !quality || !title) {
-            return res.status(400).json({ 
-                error: 'Missing required parameters: movieId, quality, title' 
-            });
-        }
-
-        const downloadInfo = await downloadManager.getDownloadLinks(movieId, title, null);
-        
-        if (!downloadInfo.qualityOptions[quality]) {
-            return res.status(404).json({ 
-                error: `Quality ${quality} not available` 
-            });
-        }
-
-        const sources = downloadInfo.qualityOptions[quality];
-        let workingUrl = null;
-
-        for (const source of sources) {
-            try {
-                const response = await axios.head(source.url, {
-                    timeout: 10000,
-                    maxRedirects: 5,
-                    validateStatus: status => status < 400
-                });
-
-                if (response.status === 200 || response.status === 302) {
-                    workingUrl = source.url;
-                    break;
-                }
-            } catch (error) {
-                continue;
-            }
-        }
-
-        if (!workingUrl) {
-            return res.status(404).json({ 
-                error: 'No working download link found for this quality' 
-            });
-        }
-
-        res.json({
-            success: true,
-            url: workingUrl,
-            quality: quality,
-            source: sources[0]?.source || 'unknown',
-            filename: `${title.replace(/[^a-z0-9]/gi, '_')}_${quality}.mp4`
-        });
-
-    } catch (error) {
-        logError('API_DOWNLOAD', error);
-        res.status(500).json({ 
-            error: 'Download failed',
-            details: error.message 
-        });
-    }
-});
-
-// Proxy download (for CORS issues)
-app.get('/api/download/proxy', async (req, res) => {
-    try {
-        const { url } = req.query;
-
-        if (!url) {
-            return res.status(400).json({ error: 'Missing URL parameter' });
-        }
-
-        const response = await axios({
-            method: 'GET',
-            url: decodeURIComponent(url),
-            responseType: 'stream',
-            timeout: 30000,
-            maxRedirects: 5,
-            headers: {
-                'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
-                'Referer': 'https://www.google.com/'
-            }
-        });
-
-        Object.entries(response.headers).forEach(([key, value]) => {
-            if (key.toLowerCase().startsWith('content-')) {
-                res.setHeader(key, value);
-            }
-        });
-
-        res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length');
-        response.data.pipe(res);
-
-    } catch (error) {
-        logError('PROXY_DOWNLOAD', error);
-        if (!res.headersSent) {
-            res.status(500).json({ error: 'Proxy download failed' });
-        }
-    }
-});
-
-// Cache management
-app.get('/api/cache/status', (req, res) => {
-    const keys = linkCache.keys();
-    res.json({
-        totalEntries: keys.length,
-        keys: keys.slice(0, 20),
-        memory: process.memoryUsage(),
-        uptime: process.uptime()
-    });
-});
-
-app.post('/api/cache/clear', (req, res) => {
-    linkCache.flushAll();
-    saveCacheToDisk();
-    res.json({ success: true, message: 'Cache cleared' });
-});
-
 // =============================================================================
-// BACKGROUND TASKS
+// ERROR LOGGING
 // =============================================================================
-async function refreshCache() {
-    const keys = linkCache.keys();
-    const refreshKeys = keys.filter(key => {
-        const value = linkCache.get(key);
-        const age = Date.now() - (value.timestamp || 0);
-        return age > 6 * 60 * 60 * 1000;
-    });
-
-    for (const key of refreshKeys.slice(0, 5)) {
-        try {
-            const movieId = key.replace('movie_', '').split('_')[0];
-            logInfo('REFRESH', `Refreshing cache for ${movieId}`);
-            
-            const movieRes = await tmdbProxy.getMovie(movieId);
-            const year = new Date(movieRes.release_date).getFullYear();
-            
-            const links = await downloadManager.extractor.extractLinks(movieId, movieRes.title, year);
-            
-            if (!links.error) {
-                linkCache.set(key, {
-                    ...links,
-                    timestamp: Date.now()
-                });
-            }
-            
-            await new Promise(r => setTimeout(r, 5000));
-            
-        } catch (error) {
-            logError('REFRESH', error, { key });
-        }
-    }
+function logError(context, error, metadata = {}) {
+    const logEntry = {
+        timestamp: new Date().toISOString(),
+        context,
+        error: error.message,
+        stack: error.stack,
+        metadata
+    };
+    
+    const logDir = path.join(__dirname, 'logs');
+    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+    
+    const logFile = path.join(logDir, `error-${new Date().toISOString().split('T')[0]}.log`);
+    fs.appendFileSync(logFile, JSON.stringify(logEntry) + '\n');
+    console.error(`❌ [${context}]`, error.message);
 }
-
-setInterval(refreshCache, 60 * 60 * 1000);
 
 // =============================================================================
 // START SERVER
 // =============================================================================
 app.listen(PORT, HOST, () => {
+    const youtubeClient = new YouTubeClient();
     console.log(`
 ╔════════════════════════════════════════════════════════════╗
-║                    VIDROOM BACKEND v2.0                    ║
-║         TMDB Proxy · Video Extraction · Cache             ║
+║                    VIDROOM BACKEND v2.1                    ║
+║         TMDB Proxy · YouTube Integration · Cache          ║
 ╠════════════════════════════════════════════════════════════╣
 ║  Server: http://${HOST}:${PORT}                                ║
-║  Cache: ${linkCache.keys().length} entries                         ║
-║  Sources: vidsrc, embed, multisrc                          ║
-║  TMDB Key: ${TMDB_API_KEY ? '✅ Configured' : '❌ Missing'}        ║
+║  YouTube API: ${youtubeClient.isConfigured ? '✅ Configured' : '❌ Missing'}        ║
+║  TMDB API: ${TMDB_API_KEY ? '✅ Configured' : '❌ Missing'}            ║
 ╚════════════════════════════════════════════════════════════╝
     `);
-});
-
-// =============================================================================
-// CLEANUP
-// =============================================================================
-process.on('SIGINT', () => {
-    logInfo('SHUTDOWN', 'Saving cache and cleaning up...');
-    saveCacheToDisk();
-    process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-    logInfo('SHUTDOWN', 'Saving cache and cleaning up...');
-    saveCacheToDisk();
-    process.exit(0);
 });
