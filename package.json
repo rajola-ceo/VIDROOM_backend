@@ -1,7 +1,7 @@
 {
   "name": "vidroom-backend",
-  "version": "2.1.0",
-  "description": "VIDROOM Streaming Server - TMDB proxy with YouTube integration",
+  "version": "2.0.0",
+  "description": "VIDROOM Streaming Server - TMDB proxy with YouTube integration and video extraction",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -12,7 +12,6 @@
     "cors": "^2.8.5",
     "axios": "^1.6.2",
     "axios-retry": "^4.0.0",
-    "cheerio": "^1.0.0-rc.12",
     "node-cache": "^5.1.2",
     "helmet": "^7.1.0",
     "compression": "^1.7.4",
