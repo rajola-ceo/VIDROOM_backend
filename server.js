@@ -1,5 +1,6 @@
 // =============================================================================
-// server.js — VIDROOM Streaming Server with YouTube Integration
+// server.js — VIDROOM Streaming Server
+// Complete system with TMDB proxy, YouTube integration, and Vidsrc support
 // =============================================================================
 
 const express = require('express');
@@ -7,14 +8,12 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const axiosRetry = require('axios-retry').default;
-const cheerio = require('cheerio');
 const NodeCache = require('node-cache');
 const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const { google } = require('googleapis');
-const os = require('os');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -25,16 +24,60 @@ const HOST = '0.0.0.0';
 // =============================================================================
 const TMDB_API_KEY = process.env.TMDB_API_KEY || '480f73d92f9395eb2140f092c746b3bc';
 const TMDB_BASE_URL = 'https://api.themoviedb.org/3';
-
-// YouTube API Configuration
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || '';
 const YOUTUBE_EMBED_BASE = 'https://www.youtube.com/embed';
-
-// Vidsrc Configuration
 const VSRC_BASE_URL = 'https://vidsrc.sbs/embed';
-
-// Cache Configuration
 const CACHE_DURATION = 86400; // 24 hours
+
+// =============================================================================
+// MIDDLEWARE
+// =============================================================================
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            frameSrc: ["'self'", "https://vidsrc.sbs", "https://www.youtube.com", "https://www.youtube-nocookie.com"],
+            imgSrc: ["'self'", "data:", "https://image.tmdb.org", "https://img.youtube.com"],
+            scriptSrc: ["'self'", "'unsafe-inline'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+        },
+    },
+}));
+
+app.use(cors({
+    origin: [
+        'http://localhost:3000',
+        'http://localhost:5500',
+        'http://127.0.0.1:5500',
+        'https://vidroom.vercel.app',
+        'https://vidroom.netlify.app',
+        '*'
+    ],
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
+}));
+
+app.use(compression());
+app.use(express.json({ limit: '10mb' }));
+
+// Rate limiting
+const limiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 200,
+    message: { error: 'Too many requests, please try again later.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.use('/api/', limiter);
+
+// =============================================================================
+// CACHE SYSTEM
+// =============================================================================
+const linkCache = new NodeCache({
+    stdTTL: CACHE_DURATION,
+    checkperiod: 3600,
+    useClones: false
+});
 
 // =============================================================================
 // YOUTUBE CLIENT
@@ -42,17 +85,22 @@ const CACHE_DURATION = 86400; // 24 hours
 class YouTubeClient {
     constructor() {
         this.apiKey = YOUTUBE_API_KEY;
-        this.youtube = google.youtube({
-            version: 'v3',
-            auth: this.apiKey
-        });
-        this.cache = new NodeCache({ stdTTL: 3600 }); // 1 hour cache for YouTube
         this.isConfigured = !!this.apiKey && this.apiKey !== '';
+        this.cache = new NodeCache({ stdTTL: 3600 });
+        
+        if (this.isConfigured) {
+            this.youtube = google.youtube({
+                version: 'v3',
+                auth: this.apiKey
+            });
+            console.log('✅ YouTube API configured');
+        } else {
+            console.log('⚠️ YouTube API key missing - using fallback mode');
+        }
     }
 
     async searchVideos(query, maxResults = 10) {
         if (!this.isConfigured) {
-            // Fallback: Use direct embed URLs without API
             return this.getFallbackResults(query, maxResults);
         }
 
@@ -74,7 +122,7 @@ class YouTubeClient {
                 id: item.id.videoId,
                 title: item.snippet.title,
                 description: item.snippet.description,
-                thumbnail: item.snippet.thumbnails.medium.url,
+                thumbnail: item.snippet.thumbnails.medium?.url || item.snippet.thumbnails.default?.url,
                 channelTitle: item.snippet.channelTitle,
                 publishedAt: item.snippet.publishedAt,
                 embedUrl: `${YOUTUBE_EMBED_BASE}/${item.id.videoId}`,
@@ -89,211 +137,9 @@ class YouTubeClient {
         }
     }
 
-    async getVideoDetails(videoId) {
-        if (!this.isConfigured) {
-            return {
-                id: videoId,
-                embedUrl: `${YOUTUBE_EMBED_BASE}/${videoId}`,
-                watchUrl: `https://www.youtube.com/watch?v=${videoId}`
-            };
-        }
-
-        const cacheKey = `video_${videoId}`;
-        const cached = this.cache.get(cacheKey);
-        if (cached) return cached;
-
-        try {
-            const response = await this.youtube.videos.list({
-                part: ['snippet', 'contentDetails', 'statistics'],
-                id: [videoId]
-            });
-
-            if (!response.data.items || response.data.items.length === 0) {
-                throw new Error('Video not found');
-            }
-
-            const item = response.data.items[0];
-            const result = {
-                id: videoId,
-                title: item.snippet.title,
-                description: item.snippet.description,
-                thumbnail: item.snippet.thumbnails.high?.url || item.snippet.thumbnails.medium?.url,
-                channelTitle: item.snippet.channelTitle,
-                publishedAt: item.snippet.publishedAt,
-                duration: item.contentDetails.duration,
-                viewCount: item.statistics.viewCount,
-                likeCount: item.statistics.likeCount,
-                embedUrl: `${YOUTUBE_EMBED_BASE}/${videoId}`,
-                watchUrl: `https://www.youtube.com/watch?v=${videoId}`
-            };
-
-            this.cache.set(cacheKey, result);
-            return result;
-        } catch (error) {
-            console.error('YouTube video details error:', error.message);
-            return {
-                id: videoId,
-                embedUrl: `${YOUTUBE_EMBED_BASE}/${videoId}`,
-                watchUrl: `https://www.youtube.com/watch?v=${videoId}`
-            };
-        }
-    }
-
-    async getMovieTrailers(movieTitle, year = null) {
-        let searchQuery = `${movieTitle} movie trailer`;
-        if (year) {
-            searchQuery += ` ${year}`;
-        }
-
-        const results = await this.searchVideos(searchQuery, 5);
-        
-        // Filter for trailers specifically
-        const trailers = results.filter(v => {
-            const title = v.title.toLowerCase();
-            return title.includes('trailer') || 
-                   title.includes('teaser') || 
-                   title.includes('official') ||
-                   title.includes('preview');
-        });
-
-        return trailers.length > 0 ? trailers : results;
-    }
-
-    async getTVShowTrailers(showTitle, season = null) {
-        let searchQuery = `${showTitle} TV show trailer`;
-        if (season) {
-            searchQuery += ` season ${season}`;
-        }
-
-        const results = await this.searchVideos(searchQuery, 5);
-        
-        const trailers = results.filter(v => {
-            const title = v.title.toLowerCase();
-            return title.includes('trailer') || 
-                   title.includes('teaser') || 
-                   title.includes('official') ||
-                   title.includes('preview');
-        });
-
-        return trailers.length > 0 ? trailers : results;
-    }
-
-    async getSoundtrack(movieTitle) {
-        const searchQuery = `${movieTitle} soundtrack`;
-        const results = await this.searchVideos(searchQuery, 8);
-        
-        // Filter for music/soundtrack
-        const music = results.filter(v => {
-            const title = v.title.toLowerCase();
-            return title.includes('soundtrack') || 
-                   title.includes('score') || 
-                   title.includes('music') ||
-                   title.includes('song') ||
-                   title.includes('theme');
-        });
-
-        return music.length > 0 ? music : results;
-    }
-
-    async getMusicVideos(query, maxResults = 10) {
-        return await this.searchVideos(query, maxResults);
-    }
-
     getFallbackResults(query, maxResults = 10) {
-        // Return embed URLs without API validation
-        const results = [];
-        const searchTerm = encodeURIComponent(query);
-        for (let i = 0; i < maxResults; i++) {
-            // This is a placeholder - actual search requires YouTube API
-            results.push({
-                id: `fallback_${i}`,
-                title: `${query} - Search Result ${i + 1}`,
-                description: 'Search result from YouTube (API key required for full results)',
-                thumbnail: 'https://via.placeholder.com/320x180?text=YouTube',
-                channelTitle: 'YouTube',
-                embedUrl: `https://www.youtube.com/embed?q=${searchTerm}`,
-                watchUrl: `https://www.youtube.com/results?search_query=${searchTerm}`,
-                isFallback: true
-            });
-        }
-        return results;
-    }
-}
-
-// =============================================================================
-// YOUTUBE EMBED GENERATOR (No API Key Required)
-// =============================================================================
-class YouTubeEmbedGenerator {
-    constructor() {
-        this.embedBase = YOUTUBE_EMBED_BASE;
-    }
-
-    // Generate direct embed URL from video ID
-    getEmbedUrl(videoId, options = {}) {
-        const params = new URLSearchParams();
-        
-        if (options.autoplay) params.append('autoplay', '1');
-        if (options.controls !== undefined) params.append('controls', options.controls ? '1' : '0');
-        if (options.rel !== undefined) params.append('rel', options.rel ? '1' : '0');
-        if (options.modestbranding !== undefined) params.append('modestbranding', options.modestbranding ? '1' : '0');
-        if (options.showinfo !== undefined) params.append('showinfo', options.showinfo ? '1' : '0');
-        if (options.start) params.append('start', options.start);
-        if (options.end) params.append('end', options.end);
-        if (options.loop) params.append('loop', '1');
-        if (options.playlist) params.append('playlist', options.playlist);
-        
-        const paramString = params.toString();
-        return `${this.embedBase}/${videoId}${paramString ? '?' + paramString : ''}`;
-    }
-
-    // Generate embed URL with search query
-    getSearchEmbed(query) {
-        return `${this.embedBase}?q=${encodeURIComponent(query)}`;
-    }
-
-    // Get YouTube thumbnail URLs
-    getThumbnails(videoId) {
-        return {
-            default: `https://img.youtube.com/vi/${videoId}/default.jpg`,
-            medium: `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
-            high: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
-            standard: `https://img.youtube.com/vi/${videoId}/sddefault.jpg`,
-            maxres: `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`
-        };
-    }
-
-    // Extract video ID from various YouTube URL formats
-    extractVideoId(url) {
-        const patterns = [
-            /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
-            /youtube\.com\/v\/([a-zA-Z0-9_-]{11})/,
-            /youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/
-        ];
-
-        for (const pattern of patterns) {
-            const match = url.match(pattern);
-            if (match) return match[1];
-        }
-
-        return null;
-    }
-}
-
-// =============================================================================
-// YOUTUBE TRAILER CACHE
-// =============================================================================
-class TrailerCache {
-    constructor() {
-        this.cache = new NodeCache({ stdTTL: 86400 }); // 24 hours
-        this.trailerMap = new Map();
-        
-        // Pre-cache popular trailer mappings
-        this.initializeTrailerMap();
-    }
-
-    initializeTrailerMap() {
-        // Common movie trailer searches that work well
-        const trailers = {
+        // Pre-defined trailer IDs for popular movies
+        const trailerMap = {
             'dune': '8Bk1TtHj_0o',
             'dune part two': 'cTAlr6m6ijU',
             'oppenheimer': 'uYPbbksJxIg',
@@ -311,47 +157,136 @@ class TrailerCache {
             'titanic': 'zCy5WQ9S4c0',
             'star wars': 'vZ734NWnAHA',
             'harry potter': 'V6xLVtpbpJg',
-            'lord of the rings': 'V75dMMIW2B4'
+            'lord of the rings': 'V75dMMIW2B4',
+            'deadpool': 'Xithigfg7dA',
+            'venom': 'u9Mv98Gr5pY',
+            'joker': 'zAGVQLHvwOY',
+            'no way home': 'rt-2cxAiPJk',
+            'far from home': 'nt8kUcMA_oQ',
+            'homecoming': '39udgPcKBAc',
+            'endgame': 'TcMBFSGVi1c',
+            'infinity war': '6ZfuNTqbHE8'
         };
 
-        Object.entries(trailers).forEach(([key, value]) => {
-            this.trailerMap.set(key, value);
-        });
-    }
+        const lowerQuery = query.toLowerCase();
+        let videoId = null;
 
-    getTrailerId(movieTitle) {
-        const lowerTitle = movieTitle.toLowerCase();
-        
-        // Check exact match
-        if (this.trailerMap.has(lowerTitle)) {
-            return this.trailerMap.get(lowerTitle);
-        }
-
-        // Check partial match
-        for (const [key, value] of this.trailerMap) {
-            if (lowerTitle.includes(key) || key.includes(lowerTitle)) {
-                return value;
+        for (const [key, value] of Object.entries(trailerMap)) {
+            if (lowerQuery.includes(key) || key.includes(lowerQuery)) {
+                videoId = value;
+                break;
             }
         }
 
-        return null;
+        if (videoId) {
+            return [{
+                id: videoId,
+                title: `${query} - Trailer`,
+                description: `Trailer for ${query}`,
+                thumbnail: `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
+                channelTitle: 'YouTube',
+                embedUrl: `${YOUTUBE_EMBED_BASE}/${videoId}`,
+                watchUrl: `https://www.youtube.com/watch?v=${videoId}`,
+                isFallback: true
+            }];
+        }
+
+        return Array.from({ length: Math.min(maxResults, 3) }, (_, i) => ({
+            id: `fallback_${i}`,
+            title: `${query} - Search Result ${i + 1}`,
+            description: 'YouTube API key required for full search results',
+            thumbnail: 'https://via.placeholder.com/320x180?text=YouTube+Search',
+            channelTitle: 'YouTube',
+            embedUrl: `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
+            watchUrl: `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
+            isFallback: true
+        }));
     }
 
-    setTrailerId(movieTitle, videoId) {
-        const lowerTitle = movieTitle.toLowerCase();
-        this.trailerMap.set(lowerTitle, videoId);
-        this.cache.set(lowerTitle, videoId);
+    async getMovieTrailers(title, year = null) {
+        let searchQuery = `${title} movie trailer`;
+        if (year) searchQuery += ` ${year}`;
+        const results = await this.searchVideos(searchQuery, 5);
+        // Filter for trailers
+        const trailers = results.filter(v => {
+            const t = v.title.toLowerCase();
+            return t.includes('trailer') || t.includes('teaser') || t.includes('official') || t.includes('preview');
+        });
+        return trailers.length > 0 ? trailers : results;
+    }
+
+    async getTVShowTrailers(title, season = null) {
+        let searchQuery = `${title} TV show trailer`;
+        if (season) searchQuery += ` season ${season}`;
+        const results = await this.searchVideos(searchQuery, 5);
+        const trailers = results.filter(v => {
+            const t = v.title.toLowerCase();
+            return t.includes('trailer') || t.includes('teaser') || t.includes('official') || t.includes('preview');
+        });
+        return trailers.length > 0 ? trailers : results;
+    }
+
+    async getSoundtrack(title) {
+        const searchQuery = `${title} soundtrack`;
+        const results = await this.searchVideos(searchQuery, 8);
+        const music = results.filter(v => {
+            const t = v.title.toLowerCase();
+            return t.includes('soundtrack') || t.includes('score') || t.includes('music') || 
+                   t.includes('song') || t.includes('theme') || t.includes('official audio');
+        });
+        return music.length > 0 ? music : results;
+    }
+
+    async getVideoDetails(videoId) {
+        if (!this.isConfigured) {
+            return {
+                id: videoId,
+                embedUrl: `${YOUTUBE_EMBED_BASE}/${videoId}`,
+                watchUrl: `https://www.youtube.com/watch?v=${videoId}`
+            };
+        }
+
+        try {
+            const response = await this.youtube.videos.list({
+                part: ['snippet', 'contentDetails', 'statistics'],
+                id: [videoId]
+            });
+
+            if (!response.data.items || response.data.items.length === 0) {
+                throw new Error('Video not found');
+            }
+
+            const item = response.data.items[0];
+            return {
+                id: videoId,
+                title: item.snippet.title,
+                description: item.snippet.description,
+                thumbnail: item.snippet.thumbnails.high?.url || item.snippet.thumbnails.medium?.url,
+                channelTitle: item.snippet.channelTitle,
+                publishedAt: item.snippet.publishedAt,
+                duration: item.contentDetails.duration,
+                viewCount: item.statistics.viewCount,
+                likeCount: item.statistics.likeCount,
+                embedUrl: `${YOUTUBE_EMBED_BASE}/${videoId}`,
+                watchUrl: `https://www.youtube.com/watch?v=${videoId}`
+            };
+        } catch (error) {
+            console.error('YouTube video details error:', error.message);
+            return {
+                id: videoId,
+                embedUrl: `${YOUTUBE_EMBED_BASE}/${videoId}`,
+                watchUrl: `https://www.youtube.com/watch?v=${videoId}`
+            };
+        }
     }
 }
 
 // =============================================================================
-// TMDB PROXY (with YouTube integration)
+// TMDB PROXY
 // =============================================================================
 class TMDBProxy {
     constructor() {
         this.youtubeClient = new YouTubeClient();
-        this.youtubeEmbed = new YouTubeEmbedGenerator();
-        this.trailerCache = new TrailerCache();
     }
 
     async getMovie(id) {
@@ -362,17 +297,19 @@ class TMDBProxy {
             const movie = response.data;
 
             // Add YouTube trailers
-            const trailers = await this.getMovieTrailers(movie.title, new Date(movie.release_date).getFullYear());
-            
+            const trailers = await this.youtubeClient.getMovieTrailers(
+                movie.title, 
+                new Date(movie.release_date).getFullYear()
+            );
+
             return {
                 ...movie,
                 youtube: {
                     trailers: trailers,
-                    embed: {
-                        url: (trailers.length > 0) ? trailers[0].embedUrl : null,
-                        watchUrl: (trailers.length > 0) ? trailers[0].watchUrl : null
-                    },
-                    thumbnails: (trailers.length > 0) ? this.youtubeEmbed.getThumbnails(trailers[0].id) : null
+                    embed: (trailers.length > 0) ? {
+                        url: trailers[0].embedUrl,
+                        watchUrl: trailers[0].watchUrl
+                    } : null
                 }
             };
         } catch (error) {
@@ -387,18 +324,16 @@ class TMDBProxy {
             );
             const show = response.data;
 
-            // Add YouTube trailers
-            const trailers = await this.getTVShowTrailers(show.name);
+            const trailers = await this.youtubeClient.getTVShowTrailers(show.name);
 
             return {
                 ...show,
                 youtube: {
                     trailers: trailers,
-                    embed: {
-                        url: (trailers.length > 0) ? trailers[0].embedUrl : null,
-                        watchUrl: (trailers.length > 0) ? trailers[0].watchUrl : null
-                    },
-                    thumbnails: (trailers.length > 0) ? this.youtubeEmbed.getThumbnails(trailers[0].id) : null
+                    embed: (trailers.length > 0) ? {
+                        url: trailers[0].embedUrl,
+                        watchUrl: trailers[0].watchUrl
+                    } : null
                 }
             };
         } catch (error) {
@@ -406,100 +341,14 @@ class TMDBProxy {
         }
     }
 
-    async getMovieTrailers(title, year) {
-        // Check cache first
-        const cacheKey = `trailer_${title}_${year || ''}`;
-        const cached = this.trailerCache.cache.get(cacheKey);
-        if (cached) return cached;
-
-        // Check pre-mapped trailers
-        const mappedId = this.trailerCache.getTrailerId(title);
-        if (mappedId) {
-            const trailer = {
-                id: mappedId,
-                title: `${title} Official Trailer`,
-                embedUrl: this.youtubeEmbed.getEmbedUrl(mappedId, { autoplay: false }),
-                watchUrl: `https://www.youtube.com/watch?v=${mappedId}`,
-                thumbnail: this.youtubeEmbed.getThumbnails(mappedId)
-            };
-            this.trailerCache.cache.set(cacheKey, [trailer]);
-            return [trailer];
-        }
-
-        try {
-            // Search YouTube for trailers
-            const results = await this.youtubeClient.getMovieTrailers(title, year);
-            
-            // Cache results
-            if (results.length > 0) {
-                this.trailerCache.cache.set(cacheKey, results);
-                // Store first result in map
-                if (results[0].id) {
-                    this.trailerCache.setTrailerId(title, results[0].id);
-                }
-            }
-            
-            return results;
-        } catch (error) {
-            console.error('Failed to fetch YouTube trailers:', error.message);
-            // Return empty array if YouTube fails
-            return [];
-        }
-    }
-
-    async getTVShowTrailers(title, season) {
-        const cacheKey = `tv_trailer_${title}_${season || ''}`;
-        const cached = this.trailerCache.cache.get(cacheKey);
-        if (cached) return cached;
-
-        try {
-            const results = await this.youtubeClient.getTVShowTrailers(title, season);
-            if (results.length > 0) {
-                this.trailerCache.cache.set(cacheKey, results);
-            }
-            return results;
-        } catch (error) {
-            console.error('Failed to fetch TV trailers:', error.message);
-            return [];
-        }
-    }
-
-    async getSoundtrack(title) {
-        try {
-            return await this.youtubeClient.getSoundtrack(title);
-        } catch (error) {
-            console.error('Failed to fetch soundtrack:', error.message);
-            return [];
-        }
-    }
-
-    async getVideos(id, type = 'movie') {
+    async getTVSeason(tvId, seasonNumber) {
         try {
             const response = await axios.get(
-                `${TMDB_BASE_URL}/${type}/${id}/videos?api_key=${TMDB_API_KEY}`
+                `${TMDB_BASE_URL}/tv/${tvId}/season/${seasonNumber}?api_key=${TMDB_API_KEY}`
             );
-            
-            const videos = response.data.results || [];
-            
-            // Enhance with YouTube embed URLs
-            const enhancedVideos = videos.map(video => {
-                if (video.site === 'YouTube') {
-                    return {
-                        ...video,
-                        embedUrl: this.youtubeEmbed.getEmbedUrl(video.key, { autoplay: false }),
-                        watchUrl: `https://www.youtube.com/watch?v=${video.key}`,
-                        thumbnail: this.youtubeEmbed.getThumbnails(video.key)
-                    };
-                }
-                return video;
-            });
-
-            return {
-                ...response.data,
-                results: enhancedVideos
-            };
+            return response.data;
         } catch (error) {
-            return { results: [] };
+            throw new Error(`TMDB season fetch failed: ${error.message}`);
         }
     }
 
@@ -528,45 +377,35 @@ class TMDBProxy {
             throw new Error(`TMDB discover failed: ${error.message}`);
         }
     }
+
+    async getVideos(id, type = 'movie') {
+        try {
+            const response = await axios.get(
+                `${TMDB_BASE_URL}/${type}/${id}/videos?api_key=${TMDB_API_KEY}`
+            );
+            return response.data;
+        } catch (error) {
+            return { results: [] };
+        }
+    }
+
+    async getSimilar(id, type = 'movie') {
+        try {
+            const response = await axios.get(
+                `${TMDB_BASE_URL}/${type}/${id}/similar?api_key=${TMDB_API_KEY}`
+            );
+            return response.data;
+        } catch (error) {
+            return { results: [] };
+        }
+    }
 }
 
 // =============================================================================
-// MIDDLEWARE
+// INITIALIZE
 // =============================================================================
-app.use(helmet({
-    contentSecurityPolicy: {
-        directives: {
-            defaultSrc: ["'self'"],
-            frameSrc: ["'self'", "https://vidsrc.sbs", "https://www.youtube.com", "https://www.youtube-nocookie.com"],
-            imgSrc: ["'self'", "data:", "https://image.tmdb.org", "https://img.youtube.com"],
-            scriptSrc: ["'self'", "'unsafe-inline'"],
-            styleSrc: ["'self'", "'unsafe-inline'"],
-        },
-    },
-}));
-
-app.use(cors({
-    origin: [
-        'http://localhost:3000',
-        'http://localhost:5500',
-        'http://127.0.0.1:5500',
-        'https://vidroom.vercel.app',
-        'https://vidroom.netlify.app'
-    ],
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Accept']
-}));
-
-app.use(compression());
-app.use(express.json({ limit: '10mb' }));
-
-// Rate limiting
-const limiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: 150,
-    message: { error: 'Too many requests, please try again later.' }
-});
-app.use('/api/', limiter);
+const tmdbProxy = new TMDBProxy();
+const youtubeClient = new YouTubeClient();
 
 // =============================================================================
 // API ENDPOINTS
@@ -574,7 +413,6 @@ app.use('/api/', limiter);
 
 // Health check
 app.get('/api/health', (req, res) => {
-    const youtubeClient = new YouTubeClient();
     res.json({
         status: 'ok',
         timestamp: Date.now(),
@@ -582,152 +420,39 @@ app.get('/api/health', (req, res) => {
         youtube: {
             configured: youtubeClient.isConfigured,
             apiKey: YOUTUBE_API_KEY ? '✅ Set' : '❌ Missing'
+        },
+        tmdb: {
+            configured: !!TMDB_API_KEY,
+            apiKey: TMDB_API_KEY ? '✅ Set' : '❌ Missing'
+        }
+    });
+});
+
+// Root
+app.get('/', (req, res) => {
+    res.json({
+        name: 'VIDROOM Backend',
+        version: '2.0.0',
+        endpoints: {
+            health: '/api/health',
+            tmdb: '/api/tmdb/{movie|tv|search|discover}',
+            youtube: '/api/youtube/{search|trailers|soundtrack}',
+            stream: '/api/stream/{movie|tv}/{id}'
         }
     });
 });
 
 // =============================================================================
-// YOUTUBE API ENDPOINTS
-// =============================================================================
-
-// Search YouTube
-app.get('/api/youtube/search', async (req, res) => {
-    try {
-        const { q, maxResults = 10 } = req.query;
-        if (!q) {
-            return res.status(400).json({ error: 'Missing search query (q)' });
-        }
-
-        const youtube = new YouTubeClient();
-        const results = await youtube.searchVideos(q, parseInt(maxResults));
-        res.json({
-            query: q,
-            results: results,
-            total: results.length
-        });
-    } catch (error) {
-        logError('YOUTUBE_SEARCH', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Get YouTube video details
-app.get('/api/youtube/video/:id', async (req, res) => {
-    try {
-        const { id } = req.params;
-        const youtube = new YouTubeClient();
-        const details = await youtube.getVideoDetails(id);
-        res.json(details);
-    } catch (error) {
-        logError('YOUTUBE_VIDEO', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Get movie trailers from YouTube
-app.get('/api/youtube/trailers/movie', async (req, res) => {
-    try {
-        const { title, year } = req.query;
-        if (!title) {
-            return res.status(400).json({ error: 'Missing movie title' });
-        }
-
-        const tmdb = new TMDBProxy();
-        const trailers = await tmdb.getMovieTrailers(title, year ? parseInt(year) : null);
-        res.json({
-            movie: title,
-            year: year || null,
-            trailers: trailers
-        });
-    } catch (error) {
-        logError('YOUTUBE_TRAILERS_MOVIE', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Get TV show trailers from YouTube
-app.get('/api/youtube/trailers/tv', async (req, res) => {
-    try {
-        const { title, season } = req.query;
-        if (!title) {
-            return res.status(400).json({ error: 'Missing TV show title' });
-        }
-
-        const tmdb = new TMDBProxy();
-        const trailers = await tmdb.getTVShowTrailers(title, season ? parseInt(season) : null);
-        res.json({
-            show: title,
-            season: season || null,
-            trailers: trailers
-        });
-    } catch (error) {
-        logError('YOUTUBE_TRAILERS_TV', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Get soundtrack from YouTube
-app.get('/api/youtube/soundtrack', async (req, res) => {
-    try {
-        const { title } = req.query;
-        if (!title) {
-            return res.status(400).json({ error: 'Missing movie title' });
-        }
-
-        const tmdb = new TMDBProxy();
-        const soundtrack = await tmdb.getSoundtrack(title);
-        res.json({
-            movie: title,
-            soundtrack: soundtrack
-        });
-    } catch (error) {
-        logError('YOUTUBE_SOUNDTRACK', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Generate YouTube embed URL
-app.get('/api/youtube/embed', async (req, res) => {
-    try {
-        const { videoId, autoplay, controls, start, end } = req.query;
-        if (!videoId) {
-            return res.status(400).json({ error: 'Missing videoId' });
-        }
-
-        const embed = new YouTubeEmbedGenerator();
-        const url = embed.getEmbedUrl(videoId, {
-            autoplay: autoplay === 'true',
-            controls: controls !== 'false',
-            start: start ? parseInt(start) : null,
-            end: end ? parseInt(end) : null
-        });
-
-        const thumbnails = embed.getThumbnails(videoId);
-
-        res.json({
-            videoId,
-            embedUrl: url,
-            thumbnails: thumbnails,
-            watchUrl: `https://www.youtube.com/watch?v=${videoId}`
-        });
-    } catch (error) {
-        logError('YOUTUBE_EMBED', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// =============================================================================
-// TMDB PROXY ENDPOINTS (with YouTube integration)
+// TMDB PROXY ENDPOINTS
 // =============================================================================
 
 app.get('/api/tmdb/movie/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const tmdb = new TMDBProxy();
-        const data = await tmdb.getMovie(id);
+        const data = await tmdbProxy.getMovie(id);
         res.json(data);
     } catch (error) {
-        logError('API_TMDB_MOVIE', error);
+        console.error('TMDB movie error:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
@@ -735,38 +460,35 @@ app.get('/api/tmdb/movie/:id', async (req, res) => {
 app.get('/api/tmdb/tv/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const tmdb = new TMDBProxy();
-        const data = await tmdb.getTV(id);
+        const data = await tmdbProxy.getTV(id);
         res.json(data);
     } catch (error) {
-        logError('API_TMDB_TV', error);
+        console.error('TMDB TV error:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
 
-app.get('/api/tmdb/:type/:id/videos', async (req, res) => {
+app.get('/api/tmdb/tv/:id/season/:season', async (req, res) => {
     try {
-        const { type, id } = req.params;
-        const tmdb = new TMDBProxy();
-        const data = await tmdb.getVideos(id, type);
+        const { id, season } = req.params;
+        const data = await tmdbProxy.getTVSeason(id, parseInt(season));
         res.json(data);
     } catch (error) {
-        logError('API_TMDB_VIDEOS', error);
+        console.error('TMDB season error:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
 
-app.get('/api/tmdb/search', async (req, res) => {
+app.get('/api/tmdb/search/multi', async (req, res) => {
     try {
         const { query } = req.query;
         if (!query) {
             return res.status(400).json({ error: 'Missing query parameter' });
         }
-        const tmdb = new TMDBProxy();
-        const data = await tmdb.search(query);
+        const data = await tmdbProxy.search(query);
         res.json(data);
     } catch (error) {
-        logError('API_TMDB_SEARCH', error);
+        console.error('TMDB search error:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
@@ -782,17 +504,177 @@ app.get('/api/tmdb/discover/:category', async (req, res) => {
             sort_by: sort_by || 'popularity.desc'
         };
         
-        const tmdb = new TMDBProxy();
-        const data = await tmdb.discover(category, params);
+        const data = await tmdbProxy.discover(category, params);
         res.json(data);
     } catch (error) {
-        logError('API_TMDB_DISCOVER', error);
+        console.error('TMDB discover error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/tmdb/:type/:id/videos', async (req, res) => {
+    try {
+        const { type, id } = req.params;
+        const data = await tmdbProxy.getVideos(id, type);
+        res.json(data);
+    } catch (error) {
+        console.error('TMDB videos error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/tmdb/movie/:id/similar', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const data = await tmdbProxy.getSimilar(id, 'movie');
+        res.json(data);
+    } catch (error) {
+        console.error('TMDB similar error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Popular endpoints
+app.get('/api/tmdb/movie/popular', async (req, res) => {
+    try {
+        const { page = 1 } = req.query;
+        const data = await tmdbProxy.discover('movie', { page, sort_by: 'popularity.desc' });
+        res.json(data);
+    } catch (error) {
+        console.error('Popular movies error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/tmdb/tv/popular', async (req, res) => {
+    try {
+        const { page = 1 } = req.query;
+        const data = await tmdbProxy.discover('tv', { page, sort_by: 'popularity.desc' });
+        res.json(data);
+    } catch (error) {
+        console.error('Popular TV error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/tmdb/movie/top_rated', async (req, res) => {
+    try {
+        const { page = 1 } = req.query;
+        const data = await tmdbProxy.discover('movie', { page, sort_by: 'vote_average.desc', 'vote_count.gte': 100 });
+        res.json(data);
+    } catch (error) {
+        console.error('Top rated error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/tmdb/movie/now_playing', async (req, res) => {
+    try {
+        const { page = 1 } = req.query;
+        const data = await tmdbProxy.discover('movie', { 
+            page, 
+            sort_by: 'primary_release_date.desc',
+            'primary_release_date.lte': new Date().toISOString().split('T')[0]
+        });
+        res.json(data);
+    } catch (error) {
+        console.error('Now playing error:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
 
 // =============================================================================
-// VSRC STREAM ENDPOINTS
+// YOUTUBE API ENDPOINTS
+// =============================================================================
+
+app.get('/api/youtube/search', async (req, res) => {
+    try {
+        const { q, maxResults = 10 } = req.query;
+        if (!q) {
+            return res.status(400).json({ error: 'Missing search query (q)' });
+        }
+
+        const results = await youtubeClient.searchVideos(q, parseInt(maxResults));
+        res.json({
+            query: q,
+            results: results,
+            total: results.length
+        });
+    } catch (error) {
+        console.error('YouTube search error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/youtube/trailers/movie', async (req, res) => {
+    try {
+        const { title, year } = req.query;
+        if (!title) {
+            return res.status(400).json({ error: 'Missing movie title' });
+        }
+
+        const trailers = await youtubeClient.getMovieTrailers(title, year ? parseInt(year) : null);
+        res.json({
+            movie: title,
+            year: year || null,
+            trailers: trailers
+        });
+    } catch (error) {
+        console.error('Movie trailers error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/youtube/trailers/tv', async (req, res) => {
+    try {
+        const { title, season } = req.query;
+        if (!title) {
+            return res.status(400).json({ error: 'Missing TV show title' });
+        }
+
+        const trailers = await youtubeClient.getTVShowTrailers(title, season ? parseInt(season) : null);
+        res.json({
+            show: title,
+            season: season || null,
+            trailers: trailers
+        });
+    } catch (error) {
+        console.error('TV trailers error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/youtube/soundtrack', async (req, res) => {
+    try {
+        const { title } = req.query;
+        if (!title) {
+            return res.status(400).json({ error: 'Missing movie title' });
+        }
+
+        const soundtrack = await youtubeClient.getSoundtrack(title);
+        res.json({
+            movie: title,
+            soundtrack: soundtrack
+        });
+    } catch (error) {
+        console.error('Soundtrack error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/youtube/video/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const details = await youtubeClient.getVideoDetails(id);
+        res.json(details);
+    } catch (error) {
+        console.error('Video details error:', error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// =============================================================================
+// STREAM ENDPOINTS
 // =============================================================================
 
 app.get('/api/stream/:type/:id', async (req, res) => {
@@ -817,39 +699,18 @@ app.get('/api/stream/:type/:id', async (req, res) => {
             episode: episode || null
         });
     } catch (error) {
-        logError('API_STREAM', error);
+        console.error('Stream error:', error.message);
         res.status(500).json({ error: error.message });
     }
 });
 
 // =============================================================================
-// ERROR LOGGING
-// =============================================================================
-function logError(context, error, metadata = {}) {
-    const logEntry = {
-        timestamp: new Date().toISOString(),
-        context,
-        error: error.message,
-        stack: error.stack,
-        metadata
-    };
-    
-    const logDir = path.join(__dirname, 'logs');
-    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
-    
-    const logFile = path.join(logDir, `error-${new Date().toISOString().split('T')[0]}.log`);
-    fs.appendFileSync(logFile, JSON.stringify(logEntry) + '\n');
-    console.error(`❌ [${context}]`, error.message);
-}
-
-// =============================================================================
 // START SERVER
 // =============================================================================
 app.listen(PORT, HOST, () => {
-    const youtubeClient = new YouTubeClient();
     console.log(`
 ╔════════════════════════════════════════════════════════════╗
-║                    VIDROOM BACKEND v2.1                    ║
+║                    VIDROOM BACKEND v2.0                    ║
 ║         TMDB Proxy · YouTube Integration · Cache          ║
 ╠════════════════════════════════════════════════════════════╣
 ║  Server: http://${HOST}:${PORT}                                ║
